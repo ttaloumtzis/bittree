@@ -3,7 +3,7 @@ mod cli;
 //mod codes;
 mod compress;
 mod decompress;
-//mod freq;
+mod freq;
 //mod header;
 //mod heap;
 //mod tree;
@@ -33,7 +33,7 @@ fn main() -> Result<()> {
 fn default_compress_output(input: &Path) -> PathBuf {
     let mut p = input.as_os_str().to_owned();
     p.push(".bitree");
-    PathBuf::from(p)
+    PathBuf::from(p) //return
 }
 
 fn default_decompress_output(input: &Path) -> PathBuf {
@@ -43,5 +43,5 @@ fn default_decompress_output(input: &Path) -> PathBuf {
     } else {
         p.set_extension("out");
     }
-    p
+    p //return
 }
