@@ -1,12 +1,12 @@
 //mod bitio;
 mod cli;
-//mod codes;
+mod codes;
 mod compress;
 mod decompress;
 mod freq;
 //mod header;
-//mod heap;
-//mod tree;
+mod heap;
+mod tree;
 
 use anyhow::Result;
 use clap::Parser;
