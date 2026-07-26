@@ -1,3 +1,4 @@
+mod archive;
 mod bitio;
 mod cli;
 mod codes;

@@ -6,18 +6,25 @@ const MAGIC: [u8; 6] = *b"BTREE1";
 pub struct Header {
     pub freqs: HashMap<u8, u32>,
     pub original_len: u64,
+    /// True if the compressed payload is a folder archive (built by
+    /// archive.rs) rather than a single plain file's bytes.
+    pub is_archive: bool,
 }
 
-/// Build the header bytes: magic + frequency table + original length.
-/// This does NOT include the compressed bitstream itself - that gets
-/// appended separately by compress.rs.
-pub fn write_header(freqs: &HashMap<u8, u32>, original_len: u64) -> Vec<u8> {
+/// Build the header bytes: magic + archive flag + frequency table +
+/// original length. This does NOT include the compressed bitstream
+/// itself - that gets appended separately by compress.rs.
+pub fn write_header(freqs: &HashMap<u8, u32>, original_len: u64, is_archive: bool) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::new();
 
     // Magic number, so decompress can check "is this really our format?"
     for byte in MAGIC {
         out.push(byte);
     }
+
+    // Single flag byte: 1 if this file was originally a folder (and
+    // needs archive::extract_archive on the way out), 0 for a plain file.
+    out.push(if is_archive { 1 } else { 0 });
 
     // Number of distinct symbols, as 4 bytes (u32 little-endian).
     let symbol_count = freqs.len() as u32;
@@ -59,6 +66,10 @@ pub fn read_header(data: &[u8]) -> (Header, usize) {
     );
     pos = pos + 6; //shift 6 pos since we checked Magic number
 
+    // Read the archive flag.
+    let is_archive = data[pos] == 1;
+    pos = pos + 1;
+
     // Read the symbol count (4 bytes, little-endian u32).
     let count_bytes = [data[pos], data[pos + 1], data[pos + 2], data[pos + 3]];
     let symbol_count = u32::from_le_bytes(count_bytes);
@@ -98,6 +109,7 @@ pub fn read_header(data: &[u8]) -> (Header, usize) {
     let header = Header {
         freqs: freqs,
         original_len: original_len,
+        is_archive: is_archive,
     };
 
     (header, pos)
@@ -116,13 +128,25 @@ mod tests {
 
         let original_len: u64 = 8;
 
-        let header_bytes = write_header(&freqs, original_len);
+        let header_bytes = write_header(&freqs, original_len, false);
         let (parsed, header_size) = read_header(&header_bytes);
 
         assert_eq!(parsed.original_len, 8);
+        assert_eq!(parsed.is_archive, false);
         assert_eq!(parsed.freqs.get(&b'a'), Some(&5));
         assert_eq!(parsed.freqs.get(&b'b'), Some(&2));
         assert_eq!(parsed.freqs.get(&b'c'), Some(&1));
         assert_eq!(header_size, header_bytes.len());
+    }
+
+    #[test]
+    fn round_trips_the_archive_flag() {
+        let mut freqs: HashMap<u8, u32> = HashMap::new();
+        freqs.insert(b'x', 1);
+
+        let header_bytes = write_header(&freqs, 1, true);
+        let (parsed, _) = read_header(&header_bytes);
+
+        assert_eq!(parsed.is_archive, true);
     }
 }

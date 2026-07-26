@@ -1,6 +1,7 @@
 use anyhow::Result;
 use std::path::Path;
 
+use crate::archive;
 use crate::bitio::BitWriter;
 use crate::codes;
 use crate::freq;
@@ -8,19 +9,38 @@ use crate::header;
 use crate::tree;
 
 pub fn run(input: &Path, output: &Path) -> Result<()> {
-    let data = std::fs::read(input)?;
+    let is_archive = input.is_dir();
+
+    // If the input is a folder, pack it into a single in-memory byte
+    // stream first (archive.rs). From this point on `data` is just a
+    // Vec<u8>, so everything below runs exactly as it did for a single
+    // file - the Huffman pipeline doesn't need to know the difference.
+    let data = if is_archive {
+        println!("input {:?} is a directory, archiving it first", input);
+        archive::build_archive(input)?
+    } else {
+        std::fs::read(input)?
+    };
     println!("read {} bytes from {:?}", data.len(), input);
 
     let freqs = freq::build_freq_table(&data);
     println!("distinct byte values: {}", freqs.len());
+
+    let original_len = data.len() as u64;
 
     let tree_root = tree::build_tree(&freqs);
 
     let tree_root = match tree_root {
         Some(root) => root,
         None => {
-            println!("input file was empty, writing empty output");
-            std::fs::write(output, [])?;
+            // Empty input (empty file, or an empty/all-empty-dirs folder).
+            // Still write a real header so decompress knows original_len
+            // is 0 and, importantly, still knows the is_archive flag -
+            // otherwise decompressing an empty archived folder would
+            // silently produce a file instead of a folder.
+            println!("input was empty, writing header-only output");
+            let header_bytes = header::write_header(&freqs, original_len, is_archive);
+            std::fs::write(output, &header_bytes)?;
             return Ok(());
         }
     };
@@ -38,9 +58,8 @@ pub fn run(input: &Path, output: &Path) -> Result<()> {
     }
     let compressed_bits = writer.finish();
 
-    // Build the header: frequency table + original length
-    let original_len = data.len() as u64;
-    let header_bytes = header::write_header(&freqs, original_len);
+    // Build the header: magic + archive flag + frequency table + original length
+    let header_bytes = header::write_header(&freqs, original_len, is_archive);
 
     // Final file = header bytes, followed by the compressed bitstream
     let mut final_bytes: Vec<u8> = Vec::new();
