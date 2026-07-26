@@ -1,4 +1,4 @@
-//mod bitio;
+mod bitio;
 mod cli;
 mod codes;
 mod compress;
