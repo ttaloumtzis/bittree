@@ -79,6 +79,54 @@ impl BitWriter {
     }
 }
 
+/// Reads individual bits back out of packed bytes, in the same
+/// left-to-right (most significant bit first) order that BitWriter used.
+pub struct BitReader<'a> {
+    bytes: &'a [u8],
+    byte_pos: usize, // which byte in `bytes` we're currently reading from
+    bit_pos: u8,     // which bit within that byte (0-7), 0 = leftmost
+}
+
+impl<'a> BitReader<'a> {
+    pub fn new(bytes: &'a [u8]) -> Self {
+        BitReader {
+            bytes,
+            byte_pos: 0,
+            bit_pos: 0,
+        }
+    }
+
+    /// Read the next single bit. Returns None if we've run out of bytes.
+    pub fn read_bit(&mut self) -> Option<bool> {
+        if self.byte_pos >= self.bytes.len() {
+            return None; // nothing left to read
+        }
+
+        let current_byte = self.bytes[self.byte_pos];
+
+        // Same left-to-right convention as BitWriter: bit_pos=0 means
+        // "leftmost bit", which is at shift position 7. bit_pos=7 means
+        // rightmost bit, shift position 0.
+        let shift = 7 - self.bit_pos;
+
+        // Shift the byte so the bit we want ends up in position 0,
+        // then mask with & 1 to isolate just that single bit, throwing
+        // away everything else. Result is either 0 or 1.
+        let bit_value = (current_byte >> shift) & 1;
+        let bit = bit_value == 1;
+
+        // advance to the next bit position, rolling over to the next
+        // byte once we've read all 8 bits of the current one
+        self.bit_pos = self.bit_pos + 1;
+        if self.bit_pos == 8 {
+            self.bit_pos = 0;
+            self.byte_pos = self.byte_pos + 1;
+        }
+
+        Some(bit)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -115,5 +163,24 @@ mod tests {
 
         let bytes = writer.finish();
         assert_eq!(bytes, vec![0b11100000]);
+    }
+
+    #[test]
+    fn reader_reverses_writer() {
+        let mut writer = BitWriter::new();
+        let bits = [
+            true, false, true, true, false, false, true, false, true, true,
+        ];
+        writer.write_bits(&bits);
+        let packed = writer.finish();
+
+        let mut reader = BitReader::new(&packed);
+        let mut read_back: Vec<bool> = Vec::new();
+        for _ in 0..bits.len() {
+            let bit = reader.read_bit().unwrap();
+            read_back.push(bit);
+        }
+
+        assert_eq!(read_back, bits);
     }
 }

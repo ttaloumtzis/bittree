@@ -4,7 +4,7 @@ mod codes;
 mod compress;
 mod decompress;
 mod freq;
-//mod header;
+mod header;
 mod heap;
 mod tree;
 

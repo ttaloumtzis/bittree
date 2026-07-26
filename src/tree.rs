@@ -29,20 +29,31 @@ use std::collections::HashMap;
 /// Build a Huffman tree from a frequency table.
 /// Returns None if the input was empty (no bytes at all).
 pub fn build_tree(freqs: &HashMap<u8, u32>) -> Option<Node> {
-    let mut heap: BinaryHeap<HeapNode> = BinaryHeap::new();
-
+    // Collect into a Vec and sort by byte value. This gives a fixed,
+    // reproducible order to build from every time - completely
+    // independent of this particular HashMap's internal (randomized)
+    // iteration order.
+    let mut entries: Vec<(u8, u32)> = Vec::new();
     for (byte, freq) in freqs {
-        let leaf = Node::Leaf {
-            byte: *byte,
-            freq: *freq,
-        };
-        heap.push(HeapNode(leaf));
+        entries.push((*byte, *freq));
+    }
+    entries.sort_by_key(|entry| entry.0);
+
+    let mut next_seq: u64 = 0;
+
+    let mut heap: BinaryHeap<HeapNode> = BinaryHeap::new();
+    for (byte, freq) in entries {
+        let leaf = Node::Leaf { byte, freq };
+        heap.push(HeapNode {
+            node: leaf,
+            seq: next_seq,
+        });
+        next_seq = next_seq + 1;
     }
 
-    // edge case - only one distinct byte in the whole file
     if heap.len() == 1 {
         let popped = heap.pop().unwrap();
-        let only_node = popped.0;
+        let only_node = popped.node;
         let freq = only_node.freq();
 
         let dummy_leaf = Node::Leaf { byte: 0, freq: 0 };
@@ -56,13 +67,12 @@ pub fn build_tree(freqs: &HashMap<u8, u32>) -> Option<Node> {
         return Some(wrapped);
     }
 
-    // repeatedly merge the two smallest nodes until one remains
     while heap.len() > 1 {
         let popped_a = heap.pop().unwrap();
-        let node_a = popped_a.0;
+        let node_a = popped_a.node;
 
         let popped_b = heap.pop().unwrap();
-        let node_b = popped_b.0;
+        let node_b = popped_b.node;
 
         let combined_freq = node_a.freq() + node_b.freq();
 
@@ -72,16 +82,19 @@ pub fn build_tree(freqs: &HashMap<u8, u32>) -> Option<Node> {
             right: Box::new(node_b),
         };
 
-        heap.push(HeapNode(merged));
+        heap.push(HeapNode {
+            node: merged,
+            seq: next_seq,
+        });
+        next_seq = next_seq + 1;
     }
 
-    // whatever is left in the heap is the finished tree
     if heap.is_empty() {
         return None;
     }
 
     let popped_root = heap.pop().unwrap();
-    let root_node = popped_root.0;
+    let root_node = popped_root.node;
     Some(root_node)
 }
 

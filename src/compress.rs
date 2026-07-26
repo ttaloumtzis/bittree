@@ -4,24 +4,21 @@ use std::path::Path;
 use crate::bitio::BitWriter;
 use crate::codes;
 use crate::freq;
+use crate::header;
 use crate::tree;
 
 pub fn run(input: &Path, output: &Path) -> Result<()> {
-    // Step 1: read the whole file into memory as raw bytes
     let data = std::fs::read(input)?;
     println!("read {} bytes from {:?}", data.len(), input);
 
-    // Step 2: count how often each byte occurs
     let freqs = freq::build_freq_table(&data);
     println!("distinct byte values: {}", freqs.len());
 
-    // Step 3: build the Huffman tree from those frequencies
     let tree_root = tree::build_tree(&freqs);
 
     let tree_root = match tree_root {
         Some(root) => root,
         None => {
-            // empty input file - nothing to compress, write an empty output
             println!("input file was empty, writing empty output");
             std::fs::write(output, [])?;
             return Ok(());
@@ -30,38 +27,45 @@ pub fn run(input: &Path, output: &Path) -> Result<()> {
 
     println!("built huffman tree, total freq = {}", tree_root.freq());
 
-    // Step 4: walk the tree to get a byte -> bitcode table
     let code_table = codes::build_codes(&tree_root);
     println!("generated codes for {} bytes", code_table.len());
 
-    // Step 5: encode every byte of the original data using its code
+    // Encode every byte of the original data using its code
     let mut writer = BitWriter::new();
-
     for byte in &data {
-        // look up the code for this byte - it MUST exist, since the
-        // code table was built from freqs, which was built from this
-        // exact same data, so every byte we see here was already counted.
         let code = code_table.get(byte).unwrap();
         writer.write_bits(code);
     }
+    let compressed_bits = writer.finish();
 
-    let compressed_bytes = writer.finish();
+    // Build the header: frequency table + original length
+    let original_len = data.len() as u64;
+    let header_bytes = header::write_header(&freqs, original_len);
 
-    // Step 6: write the compressed bytes to the output file
-    // NOTE: this is NOT decompressible yet - we haven't written a header
-    // yet (no frequency table stored), so there's no way for decompress
-    // to rebuild the same tree. That's the next piece we'll add.
-    std::fs::write(output, &compressed_bytes)?;
+    // Final file = header bytes, followed by the compressed bitstream
+    let mut final_bytes: Vec<u8> = Vec::new();
+    for b in &header_bytes {
+        final_bytes.push(*b);
+    }
+    for b in &compressed_bits {
+        final_bytes.push(*b);
+    }
+
+    std::fs::write(output, &final_bytes)?;
 
     println!(
-        "wrote {} compressed bytes to {:?} (original was {} bytes)",
-        compressed_bytes.len(),
+        "wrote {} bytes to {:?} (original was {} bytes, header was {} bytes)",
+        final_bytes.len(),
         output,
-        data.len()
+        data.len(),
+        header_bytes.len()
     );
 
-    let ratio = (compressed_bytes.len() as f64) / (data.len() as f64) * 100.0;
-    println!("compressed size is {:.1}% of original", ratio);
+    let ratio = (final_bytes.len() as f64) / (data.len() as f64) * 100.0;
+    println!(
+        "total output size is {:.1}% of original (including header)",
+        ratio
+    );
 
     Ok(())
 }
