@@ -1,14 +1,11 @@
 mod archive;
 mod bitio;
 mod cli;
-mod codes;
+mod codec;
 mod compress;
 mod decompress;
-mod freq;
 mod header;
-mod heap;
 mod meta;
-mod tree;
 
 use anyhow::Result;
 use clap::Parser;
@@ -19,9 +16,9 @@ fn main() -> Result<()> {
     let cli = cli::Cli::parse();
 
     match cli.command {
-        Command::Compress { input, output } => {
+        Command::Compress { input, output, method } => {
             let output = output.unwrap_or_else(|| default_compress_output(&input));
-            compress::run(&input, &output)?;
+            compress::run(&input, &output, method)?;
         }
         Command::Decompress { input, output } => {
             let output = output.unwrap_or_else(|| default_decompress_output(&input));
@@ -35,7 +32,7 @@ fn main() -> Result<()> {
 fn default_compress_output(input: &Path) -> PathBuf {
     let mut p = input.as_os_str().to_owned();
     p.push(".bitree");
-    PathBuf::from(p) //return
+    PathBuf::from(p)
 }
 
 fn default_decompress_output(input: &Path) -> PathBuf {
@@ -45,5 +42,5 @@ fn default_decompress_output(input: &Path) -> PathBuf {
     } else {
         p.set_extension("out");
     }
-    p //return
+    p
 }

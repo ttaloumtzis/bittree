@@ -1,34 +1,42 @@
 use anyhow::{Context, Result};
-use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
 use crate::archive;
-use crate::bitio::{BitReader, HuffmanByteReader};
-use crate::header;
+use crate::codec;
+use crate::header::CommonHeader;
 use crate::meta;
-use crate::tree;
+
+struct ProgressReader<'a, R: Read> {
+    inner: R,
+    pb: &'a indicatif::ProgressBar,
+}
+
+impl<'a, R: Read> Read for ProgressReader<'a, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.pb.inc(n as u64);
+        Ok(n)
+    }
+}
 
 pub fn run(input: &Path, output: &Path) -> Result<()> {
     let input_len = std::fs::metadata(input)
         .with_context(|| format!("reading metadata of {:?}", input))?
         .len();
 
-    // Legacy case: a completely empty .bitree file with no header at
-    // all (older versions of compress.rs wrote this for empty input).
     if input_len == 0 {
         println!("input was empty, writing empty output");
         std::fs::write(output, [])?;
         return Ok(());
     }
 
-    let file = File::open(input).with_context(|| format!("opening {:?}", input))?;
+    let file = std::fs::File::open(input).with_context(|| format!("opening {:?}", input))?;
     let mut buf_reader = BufReader::new(file);
 
-    let header =
-        header::read_header_from_reader(&mut buf_reader).context("failed to read header")?;
+    let common = CommonHeader::read(&mut buf_reader).context("failed to read header")?;
 
-    let pb = indicatif::ProgressBar::new(header.original_len);
+    let pb = indicatif::ProgressBar::new(common.original_len);
     pb.set_style(
         indicatif::ProgressStyle::default_bar()
             .template("[{elapsed_precise}] {bar:40.cyan/blue} {bytes}/{total_bytes} ({eta})")
@@ -36,65 +44,51 @@ pub fn run(input: &Path, output: &Path) -> Result<()> {
             .progress_chars("##-"),
     );
 
-    println!("original length was {} bytes", header.original_len);
-    println!("distinct byte values in header: {}", header.freqs.len());
-    println!("is folder archive: {}", header.is_archive);
+    println!("original length was {} bytes", common.original_len);
+    println!("method id: {}", common.method_id);
+    println!("is folder archive: {}", common.is_archive);
 
-    if header.original_len == 0 {
-        // Header-only file: empty input was compressed — just write
-        // an empty result (file or folder depending on the archive flag).
+    if common.original_len == 0 {
         println!("decoded 0 bytes");
-        if header.is_archive {
+        if common.is_archive {
             std::fs::create_dir_all(output)
                 .with_context(|| format!("creating output directory {:?}", output))?;
         } else {
             std::fs::write(output, [])?;
-            meta::apply_meta(output, &header.meta)?;
+            meta::apply_meta(output, &common.meta)?;
         }
         return Ok(());
     }
 
-    let tree_root =
-        tree::build_tree(&header.freqs).expect("header had frequencies but tree build failed");
+    let mut codec = codec::by_id(common.method_id);
+    codec.read_header(&mut buf_reader).context("failed to read codec header")?;
 
-    let bit_reader = BitReader::new(buf_reader);
-    let mut huffman_reader = HuffmanByteReader::new(&tree_root, bit_reader, header.original_len);
+    let decoder = codec.decoder(Box::new(buf_reader), common.original_len);
+    let mut progress = ProgressReader { inner: decoder, pb: &pb };
 
-    if header.is_archive {
-        let spinner = indicatif::ProgressBar::new_spinner();
-        spinner.enable_steady_tick(std::time::Duration::from_millis(100));
-        spinner.set_style(
-            indicatif::ProgressStyle::default_spinner()
-                .template("{spinner:.green} extracting...")
-                .unwrap(),
-        );
-
-        archive::extract_archive_from_reader(&mut huffman_reader, output)?;
-
-        spinner.finish_with_message("extracted");
-
+    if common.is_archive {
+        archive::extract_archive_from_reader(&mut progress, output)?;
+        pb.finish_and_clear();
         println!("extracted folder archive to {:?}", output);
     } else {
-        let out_file =
-            File::create(output).with_context(|| format!("creating output file {:?}", output))?;
+        let out_file = std::fs::File::create(output)
+            .with_context(|| format!("creating output file {:?}", output))?;
         let mut out_writer = BufWriter::new(out_file);
 
         let mut buf = [0u8; 64 * 1024];
         let mut bytes_written = 0u64;
         loop {
-            let n = huffman_reader.read(&mut buf)?;
+            let n = progress.read(&mut buf)?;
             if n == 0 {
                 break;
             }
             out_writer.write_all(&buf[..n])?;
             bytes_written += n as u64;
-            pb.inc(n as u64);
         }
         pb.finish_and_clear();
 
         out_writer.flush()?;
-
-        meta::apply_meta(output, &header.meta)?;
+        meta::apply_meta(output, &common.meta)?;
         println!("wrote {} decompressed bytes to {:?}", bytes_written, output);
     }
 

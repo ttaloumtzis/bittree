@@ -1,6 +1,8 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+use crate::codec;
+
 #[derive(Parser)]
 #[command(name = "bitree", version, about)]
 pub struct Cli {
@@ -10,22 +12,19 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
-    // Compress command definition
     Compress {
-        // Input file to compress
         input: PathBuf,
 
-        // Output file (defaults to <input.bitree>)
         #[arg(short, long)]
         output: Option<PathBuf>,
+
+        #[arg(short, long, value_enum, default_value_t = codec::Method::Huffman)]
+        method: codec::Method,
     },
 
-    // Decompress a .bitree file
     Decompress {
-        // Input .bitree file
         input: PathBuf,
 
-        // Output file (defaults ro striping .bitree)
         #[arg(short, long)]
         output: Option<PathBuf>,
     },

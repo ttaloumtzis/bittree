@@ -5,16 +5,12 @@ use std::path::{Path, PathBuf};
 
 use crate::meta;
 
-/// Bumped from BTAR01 -> BTAR02: entries now carry per-entry metadata
-/// (mtime + permissions), so an old archive must fail fast with a clear
-/// error instead of being misparsed against the new layout.
+/// Archive magic — bumped BTAR01 -> BTAR02 when metadata was added.
 const ARCHIVE_MAGIC: [u8; 6] = *b"BTAR02";
 
 const ENTRY_FILE: u8 = 0;
 const ENTRY_DIR: u8 = 1;
 
-/// One entry to be archived, with everything needed except the file's
-/// content bytes (which are re-read from disk on demand, not stored here).
 pub struct PlannedEntry {
     pub relative: PathBuf,
     pub full_path: PathBuf,
@@ -22,8 +18,7 @@ pub struct PlannedEntry {
     pub meta: meta::FileMeta,
 }
 
-/// Walk `root` and build the (small) list of what will go into the
-/// archive. No file content is touched here - just paths + metadata.
+/// Collect paths + metadata (no file content).
 pub fn plan_archive(root: &Path) -> Result<Vec<PlannedEntry>> {
     let entries = collect_entries(root)?;
 
@@ -49,9 +44,7 @@ pub fn plan_archive(root: &Path) -> Result<Vec<PlannedEntry>> {
     Ok(planned)
 }
 
-/// Recursively walk `root` and collect every file/dir path relative to
-/// it, in a fixed sorted order so the same folder always produces the
-/// same archive bytes (useful for tests / reproducibility).
+/// Recursive dir walk, sorted for reproducibility.
 fn collect_entries(root: &Path) -> Result<Vec<PathBuf>> {
     let mut entries = Vec::new();
     collect_entries_inner(root, root, &mut entries)?;
@@ -82,9 +75,7 @@ fn collect_entries_inner(root: &Path, current: &Path, out: &mut Vec<PathBuf>) ->
     Ok(())
 }
 
-/// Archive paths are always stored with '/' separators (regardless of
-/// the host OS), so a .bitree archive made on Windows can be extracted
-/// correctly on Linux/macOS and vice versa.
+/// Normalize path to '/' separators for portability.
 fn to_archive_path_string(p: &Path) -> String {
     p.components()
         .map(|c| c.as_os_str().to_string_lossy().into_owned())
@@ -93,20 +84,11 @@ fn to_archive_path_string(p: &Path) -> String {
 }
 
 fn write_path(out: &mut Vec<u8>, path_bytes: &[u8]) {
-    let len = path_bytes.len() as u16;
-    for b in len.to_le_bytes() {
-        out.push(b);
-    }
-    for b in path_bytes {
-        out.push(*b);
-    }
+    out.extend_from_slice(&(path_bytes.len() as u16).to_le_bytes());
+    out.extend_from_slice(path_bytes);
 }
 
-/// Stream the archive's bytes to `sink`, one chunk at a time, without
-/// ever holding the whole archive (or a whole file's contents) in
-/// memory at once. Call this once per pass (e.g. once to count
-/// frequencies, once to encode) - it re-reads file content from disk
-/// each time, since PlannedEntry never stores content itself.
+/// Stream archive bytes to `sink` in chunks (no full buffering).
 pub fn stream_archive(
     plan: &[PlannedEntry],
     mut sink: impl FnMut(&[u8]) -> Result<()>,
@@ -132,8 +114,6 @@ pub fn stream_archive(
             let content_len = fs::metadata(&entry.full_path)?.len();
             sink(&content_len.to_le_bytes())?;
 
-            // Stream the file itself in fixed-size chunks instead of
-            // fs::read()-ing the whole thing into memory.
             let file = fs::File::open(&entry.full_path)
                 .with_context(|| format!("opening file {:?}", entry.full_path))?;
             let mut reader = std::io::BufReader::new(file);
@@ -151,34 +131,16 @@ pub fn stream_archive(
     Ok(())
 }
 
-/// Pack an entire directory tree into a single in-memory byte stream.
-///
-/// This is the "tar" step, and it happens BEFORE Huffman compression -
-/// the result is just a Vec<u8>, so compress.rs can treat it exactly
-/// like the bytes of a regular file and run the existing pipeline
-/// (freq table -> tree -> codes -> bit packing) over it unchanged.
-///
-/// Format (v2):
-///   MAGIC (6 bytes: "BTAR02")
-///   entry_count (u32 LE)
-///   for each entry:
-///     kind (1 byte: 0 = file, 1 = dir)
-///     path_len (u16 LE)
-///     path bytes (UTF-8, '/' separated, relative to root)
-///     metadata (12 bytes: 8 mtime + 4 permissions)
-///     [file only] content_len (u64 LE) + content bytes
+/// Pack a directory tree into `Vec<u8>`.
+/// Format: MAGIC + entry_count(u32 LE) + entries(kind|path|meta|content)
 pub fn build_archive(root: &Path) -> Result<Vec<u8>> {
     let entries = collect_entries(root)?;
 
     let mut out: Vec<u8> = Vec::new();
-    for b in ARCHIVE_MAGIC {
-        out.push(b);
-    }
+    out.extend_from_slice(&ARCHIVE_MAGIC);
 
     let entry_count = entries.len() as u32;
-    for b in entry_count.to_le_bytes() {
-        out.push(b);
-    }
+    out.extend_from_slice(&entry_count.to_le_bytes());
 
     for relative in &entries {
         let full_path = root.join(relative);
@@ -199,34 +161,19 @@ pub fn build_archive(root: &Path) -> Result<Vec<u8>> {
             let content =
                 fs::read(&full_path).with_context(|| format!("reading file {:?}", full_path))?;
             let content_len = content.len() as u64;
-            for b in content_len.to_le_bytes() {
-                out.push(b);
-            }
-            for b in &content {
-                out.push(*b);
-            }
+            out.extend_from_slice(&content_len.to_le_bytes());
+            out.extend_from_slice(&content);
         }
     }
 
     Ok(out)
 }
 
-/// Unpack an archive byte stream back into real files and directories
-/// under `dest_root`.
-///
-/// Directory metadata is applied in a SECOND pass, after every file has
-/// been written. Writing a file into a folder updates that folder's own
-/// mtime, so applying a directory's saved mtime immediately after
-/// creating it would just get overwritten by the files written into it
-/// afterward.
 pub fn extract_archive(data: &[u8], dest_root: &Path) -> Result<()> {
     extract_archive_from_reader(&mut std::io::Cursor::new(data), dest_root)
 }
 
-/// Streaming version of `extract_archive` — reads the archive format from
-/// any `Read` stream without requiring the whole archive to be in memory.
-/// Directory metadata is deferred to a second pass (same as
-/// `extract_archive`) so file writes don't clobber directory mtimes.
+/// Directory metadata is deferred to a second pass (so file writes don't clobber dir mtimes).
 pub fn extract_archive_from_reader<R: Read>(
     reader: &mut R,
     dest_root: &Path,
