@@ -1,4 +1,5 @@
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
+use std::io::Read;
 use std::path::Path;
 use std::time::UNIX_EPOCH;
 
@@ -90,4 +91,24 @@ pub fn apply_meta(path: &Path, meta: &FileMeta) -> Result<()> {
     filetime::set_file_mtime(path, mtime)?;
 
     Ok(())
+}
+
+/// Read metadata directly from any stream implementing `Read`.
+pub fn read_meta_from_reader<R: Read>(reader: &mut R) -> Result<FileMeta> {
+    let mut secs_bytes = [0u8; 8];
+    reader
+        .read_exact(&mut secs_bytes)
+        .context("failed to read modified timestamp from metadata")?;
+    let modified_secs = u64::from_le_bytes(secs_bytes);
+
+    let mut perm_bytes = [0u8; 4];
+    reader
+        .read_exact(&mut perm_bytes)
+        .context("failed to read permissions from metadata")?;
+    let permissions = u32::from_le_bytes(perm_bytes);
+
+    Ok(FileMeta {
+        modified_secs,
+        permissions,
+    })
 }

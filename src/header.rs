@@ -1,7 +1,8 @@
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
+use std::io::Read;
 
-use crate::meta::{FileMeta, read_meta_bytes, write_meta_bytes};
+use crate::meta::{FileMeta, read_meta_bytes, read_meta_from_reader, write_meta_bytes};
 
 /// Bumped from BTREE1 -> BTREE2: the header now carries the original
 /// file's metadata (mtime + permissions), so an old .bitree file fails
@@ -164,6 +165,70 @@ pub fn read_header(data: &[u8]) -> Result<(Header, usize)> {
     };
 
     Ok((header, pos))
+}
+
+/// Same as `read_header`, but reads from any `Read` stream instead of
+/// requiring the whole (potentially huge) compressed file's bytes to
+/// already be sitting in memory - decompress.rs uses this so it only
+/// ever pulls in what the header actually needs.
+pub fn read_header_from_reader<R: Read>(reader: &mut R) -> Result<Header> {
+    let mut magic = [0u8; 6];
+    reader
+        .read_exact(&mut magic)
+        .context("data too short to contain a magic number")?;
+    if magic != MAGIC {
+        bail!("not a valid bitree file (bad magic number)");
+    }
+
+    let mut flag_byte = [0u8; 1];
+    reader
+        .read_exact(&mut flag_byte)
+        .context("truncated header: missing archive flag byte")?;
+    let is_archive = flag_byte[0] == 1;
+
+    let meta = read_meta_from_reader(reader).context("truncated header: missing metadata")?;
+
+    let mut count_bytes = [0u8; 8];
+    reader
+        .read_exact(&mut count_bytes)
+        .context("truncated header: missing symbol count")?;
+    let symbol_count = u64::from_le_bytes(count_bytes);
+
+    let mut freqs: HashMap<u8, u64> = HashMap::new();
+    for _ in 0..symbol_count {
+        // Each entry is 1 byte (symbol) + 8 bytes (freq) = 9 bytes.
+        let mut entry_bytes = [0u8; 9];
+        reader
+            .read_exact(&mut entry_bytes)
+            .context("truncated header: symbol table cut short")?;
+
+        let byte_value = entry_bytes[0];
+        let freq_bytes = [
+            entry_bytes[1],
+            entry_bytes[2],
+            entry_bytes[3],
+            entry_bytes[4],
+            entry_bytes[5],
+            entry_bytes[6],
+            entry_bytes[7],
+            entry_bytes[8],
+        ];
+        let freq_value = u64::from_le_bytes(freq_bytes);
+        freqs.insert(byte_value, freq_value);
+    }
+
+    let mut len_bytes = [0u8; 8];
+    reader
+        .read_exact(&mut len_bytes)
+        .context("truncated header: missing original length")?;
+    let original_len = u64::from_le_bytes(len_bytes);
+
+    Ok(Header {
+        freqs,
+        original_len,
+        is_archive,
+        meta,
+    })
 }
 
 #[cfg(test)]

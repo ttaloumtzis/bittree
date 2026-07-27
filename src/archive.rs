@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
 use std::fs;
+use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 use crate::meta;
@@ -11,6 +12,42 @@ const ARCHIVE_MAGIC: [u8; 6] = *b"BTAR02";
 
 const ENTRY_FILE: u8 = 0;
 const ENTRY_DIR: u8 = 1;
+
+/// One entry to be archived, with everything needed except the file's
+/// content bytes (which are re-read from disk on demand, not stored here).
+pub struct PlannedEntry {
+    pub relative: PathBuf,
+    pub full_path: PathBuf,
+    pub kind: u8, // ENTRY_FILE or ENTRY_DIR
+    pub meta: meta::FileMeta,
+}
+
+/// Walk `root` and build the (small) list of what will go into the
+/// archive. No file content is touched here - just paths + metadata.
+pub fn plan_archive(root: &Path) -> Result<Vec<PlannedEntry>> {
+    let entries = collect_entries(root)?;
+
+    let mut planned = Vec::with_capacity(entries.len());
+    for relative in entries {
+        let full_path = root.join(&relative);
+        let kind = if full_path.is_dir() {
+            ENTRY_DIR
+        } else {
+            ENTRY_FILE
+        };
+        let meta = meta::read_meta(&full_path)
+            .with_context(|| format!("reading metadata for {:?}", full_path))?;
+
+        planned.push(PlannedEntry {
+            relative,
+            full_path,
+            kind,
+            meta,
+        });
+    }
+
+    Ok(planned)
+}
 
 /// Recursively walk `root` and collect every file/dir path relative to
 /// it, in a fixed sorted order so the same folder always produces the
@@ -63,6 +100,55 @@ fn write_path(out: &mut Vec<u8>, path_bytes: &[u8]) {
     for b in path_bytes {
         out.push(*b);
     }
+}
+
+/// Stream the archive's bytes to `sink`, one chunk at a time, without
+/// ever holding the whole archive (or a whole file's contents) in
+/// memory at once. Call this once per pass (e.g. once to count
+/// frequencies, once to encode) - it re-reads file content from disk
+/// each time, since PlannedEntry never stores content itself.
+pub fn stream_archive(
+    plan: &[PlannedEntry],
+    mut sink: impl FnMut(&[u8]) -> Result<()>,
+) -> Result<()> {
+    sink(&ARCHIVE_MAGIC)?;
+
+    let entry_count = plan.len() as u32;
+    sink(&entry_count.to_le_bytes())?;
+
+    for entry in plan {
+        let path_str = to_archive_path_string(&entry.relative);
+        let path_bytes = path_str.as_bytes();
+
+        sink(&[entry.kind])?;
+        sink(&(path_bytes.len() as u16).to_le_bytes())?;
+        sink(path_bytes)?;
+
+        let mut meta_bytes = Vec::new();
+        meta::write_meta_bytes(&mut meta_bytes, &entry.meta);
+        sink(&meta_bytes)?;
+
+        if entry.kind == ENTRY_FILE {
+            let content_len = fs::metadata(&entry.full_path)?.len();
+            sink(&content_len.to_le_bytes())?;
+
+            // Stream the file itself in fixed-size chunks instead of
+            // fs::read()-ing the whole thing into memory.
+            let file = fs::File::open(&entry.full_path)
+                .with_context(|| format!("opening file {:?}", entry.full_path))?;
+            let mut reader = std::io::BufReader::new(file);
+            let mut buf = [0u8; 64 * 1024];
+            loop {
+                let n = reader.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                sink(&buf[..n])?;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Pack an entire directory tree into a single in-memory byte stream.
@@ -134,22 +220,28 @@ pub fn build_archive(root: &Path) -> Result<Vec<u8>> {
 /// creating it would just get overwritten by the files written into it
 /// afterward.
 pub fn extract_archive(data: &[u8], dest_root: &Path) -> Result<()> {
-    let mut pos: usize = 0;
-    // Even an "empty folder" archive still has magic + count (10 bytes),
-    // so anything shorter than that can't be valid.
-    if data.len() < 10 {
-        bail!("archive data too short to be valid");
-    }
+    extract_archive_from_reader(&mut std::io::Cursor::new(data), dest_root)
+}
 
-    let magic = &data[0..6];
+/// Streaming version of `extract_archive` — reads the archive format from
+/// any `Read` stream without requiring the whole archive to be in memory.
+/// Directory metadata is deferred to a second pass (same as
+/// `extract_archive`) so file writes don't clobber directory mtimes.
+pub fn extract_archive_from_reader<R: Read>(
+    reader: &mut R,
+    dest_root: &Path,
+) -> Result<()> {
+    let mut magic = [0u8; 6];
+    reader
+        .read_exact(&mut magic)
+        .context("archive data too short to be valid")?;
     if magic != ARCHIVE_MAGIC {
         bail!("not a valid bitree archive (bad magic number)");
     }
-    pos = pos + 6;
 
-    let count_bytes = [data[pos], data[pos + 1], data[pos + 2], data[pos + 3]];
-    let entry_count = u32::from_le_bytes(count_bytes);
-    pos += 4;
+    let mut count_buf = [0u8; 4];
+    reader.read_exact(&mut count_buf)?;
+    let entry_count = u32::from_le_bytes(count_buf);
 
     fs::create_dir_all(dest_root)
         .with_context(|| format!("creating output directory {:?}", dest_root))?;
@@ -157,23 +249,23 @@ pub fn extract_archive(data: &[u8], dest_root: &Path) -> Result<()> {
     let mut pending_dir_meta: Vec<(PathBuf, meta::FileMeta)> = Vec::new();
 
     for _ in 0..entry_count {
-        let kind = data[pos];
-        pos += 1;
+        let mut kind_buf = [0u8; 1];
+        reader.read_exact(&mut kind_buf)?;
+        let kind = kind_buf[0];
 
-        let path_len = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
-        pos += 2;
+        let mut path_len_buf = [0u8; 2];
+        reader.read_exact(&mut path_len_buf)?;
+        let path_len = u16::from_le_bytes(path_len_buf) as usize;
 
-        let path_str = std::str::from_utf8(&data[pos..pos + path_len])
-            .context("archive entry path was not valid UTF-8")?
-            .to_owned();
-        pos += path_len;
+        let mut path_bytes = vec![0u8; path_len];
+        reader.read_exact(&mut path_bytes)?;
+        let path_str = String::from_utf8(path_bytes)
+            .context("archive entry path was not valid UTF-8")?;
 
-        // Archive paths always use '/'; rebuild a native, OS-correct
-        // PathBuf from that (so this works the same on Windows too).
         let relative: PathBuf = path_str.split('/').collect();
         let full_path = dest_root.join(&relative);
 
-        let file_meta = meta::read_meta_bytes(data, &mut pos)
+        let file_meta = meta::read_meta_from_reader(reader)
             .with_context(|| format!("reading metadata for {:?}", full_path))?;
 
         if kind == ENTRY_DIR {
@@ -181,41 +273,42 @@ pub fn extract_archive(data: &[u8], dest_root: &Path) -> Result<()> {
                 .with_context(|| format!("creating directory {:?}", full_path))?;
             pending_dir_meta.push((full_path, file_meta));
         } else {
-            let content_len_bytes = [
-                data[pos],
-                data[pos + 1],
-                data[pos + 2],
-                data[pos + 3],
-                data[pos + 4],
-                data[pos + 5],
-                data[pos + 6],
-                data[pos + 7],
-            ];
-            let content_len = u64::from_le_bytes(content_len_bytes) as usize;
-            pos += 8;
+            let mut content_len_buf = [0u8; 8];
+            reader.read_exact(&mut content_len_buf)?;
+            let content_len = u64::from_le_bytes(content_len_buf);
 
-            let content = &data[pos..pos + content_len];
-            pos += content_len;
-
-            // A file's parent dir entry is usually archived separately,
-            // but create_dir_all here is cheap insurance either way.
             if let Some(parent) = full_path.parent() {
                 fs::create_dir_all(parent)
                     .with_context(|| format!("creating directory {:?}", parent))?;
             }
 
-            fs::write(&full_path, content)
-                .with_context(|| format!("writing file {:?}", full_path))?;
+            let out_file = fs::File::create(&full_path)
+                .with_context(|| format!("creating file {:?}", full_path))?;
+            let mut writer = BufWriter::new(out_file);
 
-            // Files are safe to apply immediately - nothing gets written
-            // into a file after it's written that would disturb its mtime.
+            let mut transferred = 0u64;
+            let mut buf = [0u8; 64 * 1024];
+            while transferred < content_len {
+                let remaining = content_len - transferred;
+                let to_read = std::cmp::min(buf.len() as u64, remaining) as usize;
+                let n = reader
+                    .read(&mut buf[..to_read])
+                    .context("unexpected EOF reading file content")?;
+                if n == 0 {
+                    bail!("unexpected EOF reading file content in {:?}", full_path);
+                }
+                writer
+                    .write_all(&buf[..n])
+                    .with_context(|| format!("writing file {:?}", full_path))?;
+                transferred += n as u64;
+            }
+            writer.flush()?;
+
             meta::apply_meta(&full_path, &file_meta)
                 .with_context(|| format!("applying metadata to {:?}", full_path))?;
         }
     }
 
-    // Second pass: now that every file is in place, set directory mtimes
-    // last so they aren't clobbered by the writes above.
     for (dir_path, dir_meta) in &pending_dir_meta {
         meta::apply_meta(dir_path, dir_meta)
             .with_context(|| format!("applying metadata to {:?}", dir_path))?;

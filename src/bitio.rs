@@ -1,25 +1,29 @@
+// bitio.rs
+use crate::tree::Node;
+use std::io::{self, Read, Write};
+
 /// Accumulates individual bits and packs them into real bytes.
 ///
 /// Bits are filled left-to-right (most significant bit first) within
 /// each byte, so if you write bits: 1,0,1,1,0,0,1,0
 /// you get the byte: 0b10110010
-pub struct BitWriter {
-    bytes: Vec<u8>,   // completed, full bytes go here
-    current_byte: u8, // the byte currently being built, one bit at a time
-    bits_filled: u8,  // how many of current_byte's 8 slots are used (0-7)
+pub struct BitWriter<W: Write> {
+    out: W,
+    current_byte: u8,
+    bits_filled: u8,
 }
 
-impl BitWriter {
-    pub fn new() -> Self {
+impl<W: Write> BitWriter<W> {
+    pub fn new(out: W) -> Self {
         BitWriter {
-            bytes: Vec::new(),
-            current_byte: 0, // starts as 0b00000000 - every bit unset
+            out,
+            current_byte: 0,
             bits_filled: 0,
         }
     }
 
     /// Write a single bit (true = 1, false = 0) into current_byte.
-    pub fn write_bit(&mut self, bit: bool) {
+    pub fn write_bit(&mut self, bit: bool) -> io::Result<()> {
         if bit {
             // We fill left-to-right, so the FIRST bit written goes into
             // position 7 (the leftmost / most significant bit), the
@@ -42,28 +46,30 @@ impl BitWriter {
             // Example: if current_byte is 0b10100000 and we OR in
             // 0b00001000 (shift=3), the result is 0b10101000 - the new
             // bit gets added, everything else stays exactly as it was.
-            self.current_byte = self.current_byte | (1 << shift);
+            self.current_byte |= 1 << shift;
         }
         // if bit is false, we do nothing at all - that position in
         // current_byte is already 0 by default, so there's nothing to set.
 
-        self.bits_filled = self.bits_filled + 1;
+        self.bits_filled += 1;
 
         // Once we've placed 8 bits, current_byte is a complete, real byte.
         // Push it into the finished list and reset to start building
         // the next byte from scratch.
         if self.bits_filled == 8 {
-            self.bytes.push(self.current_byte);
+            self.out.write_all(&[self.current_byte])?;
             self.current_byte = 0;
             self.bits_filled = 0;
         }
+        Ok(())
     }
 
     /// Write a whole sequence of bits at once (e.g. one Huffman code).
-    pub fn write_bits(&mut self, bits: &[bool]) {
+    pub fn write_bits(&mut self, bits: &[bool]) -> io::Result<()> {
         for bit in bits {
-            self.write_bit(*bit);
+            self.write_bit(*bit)?;
         }
+        Ok(())
     }
 
     /// Call this when done writing all bits. If the last byte is only
@@ -71,59 +77,118 @@ impl BitWriter {
     /// positions on the right are left as 0 (padding) and the byte is
     /// pushed anyway - a partial byte still has to occupy a full byte
     /// on disk, there's no such thing as writing "3 bits" to a file.
-    pub fn finish(mut self) -> Vec<u8> {
+    pub fn finish(mut self) -> io::Result<W> {
         if self.bits_filled > 0 {
-            self.bytes.push(self.current_byte);
+            self.out.write_all(&[self.current_byte])?;
         }
-        self.bytes
+        Ok(self.out)
     }
 }
 
 /// Reads individual bits back out of packed bytes, in the same
 /// left-to-right (most significant bit first) order that BitWriter used.
-pub struct BitReader<'a> {
-    bytes: &'a [u8],
-    byte_pos: usize, // which byte in `bytes` we're currently reading from
-    bit_pos: u8,     // which bit within that byte (0-7), 0 = leftmost
+pub struct BitReader<R: std::io::Read> {
+    inner: std::io::BufReader<R>,
+    current_byte: u8, // which byte in `bytes` we're currently reading from
+    bit_pos: u8,      // which bit within that byte (0-7), 0 = leftmost
+    exhausted: bool,
 }
 
-impl<'a> BitReader<'a> {
-    pub fn new(bytes: &'a [u8]) -> Self {
+impl<R: std::io::Read> BitReader<R> {
+    pub fn new(inner: R) -> Self {
         BitReader {
-            bytes,
-            byte_pos: 0,
-            bit_pos: 0,
+            inner: std::io::BufReader::new(inner),
+            current_byte: 0,
+            bit_pos: 8, // force a read on first call
+            exhausted: false,
         }
     }
 
     /// Read the next single bit. Returns None if we've run out of bytes.
-    pub fn read_bit(&mut self) -> Option<bool> {
-        if self.byte_pos >= self.bytes.len() {
-            return None; // nothing left to read
+    pub fn read_bit(&mut self) -> io::Result<Option<bool>> {
+        if self.exhausted {
+            return Ok(None);
         }
 
-        let current_byte = self.bytes[self.byte_pos];
-
-        // Same left-to-right convention as BitWriter: bit_pos=0 means
-        // "leftmost bit", which is at shift position 7. bit_pos=7 means
-        // rightmost bit, shift position 0.
-        let shift = 7 - self.bit_pos;
-
-        // Shift the byte so the bit we want ends up in position 0,
-        // then mask with & 1 to isolate just that single bit, throwing
-        // away everything else. Result is either 0 or 1.
-        let bit_value = (current_byte >> shift) & 1;
-        let bit = bit_value == 1;
-
-        // advance to the next bit position, rolling over to the next
-        // byte once we've read all 8 bits of the current one
-        self.bit_pos = self.bit_pos + 1;
         if self.bit_pos == 8 {
-            self.bit_pos = 0;
-            self.byte_pos = self.byte_pos + 1;
+            let mut buf = [0u8; 1];
+            match self.inner.read(&mut buf)? {
+                0 => {
+                    self.exhausted = true;
+                    return Ok(None);
+                }
+                _ => {
+                    self.current_byte = buf[0];
+                    self.bit_pos = 0;
+                }
+            }
         }
 
-        Some(bit)
+        let shift = 7 - self.bit_pos;
+        let bit = (self.current_byte >> shift) & 1 == 1;
+        self.bit_pos += 1;
+        Ok(Some(bit))
+    }
+}
+
+/// Decodes a Huffman-compressed bitstream back into raw bytes, one
+/// byte at a time, on demand - implemented as an ordinary `Read` so
+/// callers (a plain file write, or archive extraction) can pull
+/// decoded bytes in small chunks instead of requiring the whole
+/// decompressed payload to be built up in memory first.
+pub struct HuffmanByteReader<'a, R: Read> {
+    tree_root: &'a Node,
+    bit_reader: BitReader<R>,
+    // How many decoded bytes are still owed before we've reproduced
+    // the full original_len - needed because the tree alone can't
+    // tell us where the (possibly zero-padded) bitstream ends.
+    remaining: u64,
+}
+
+impl<'a, R: Read> HuffmanByteReader<'a, R> {
+    pub fn new(tree_root: &'a Node, bit_reader: BitReader<R>, original_len: u64) -> Self {
+        HuffmanByteReader {
+            tree_root,
+            bit_reader,
+            remaining: original_len,
+        }
+    }
+}
+
+impl<'a, R: Read> Read for HuffmanByteReader<'a, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let mut written = 0;
+
+        while written < buf.len() && self.remaining > 0 {
+            // Walk from the root, bit by bit, until we land on a leaf -
+            // that leaf's byte is the next decoded byte.
+            let mut current = self.tree_root;
+            loop {
+                match current {
+                    Node::Leaf { byte, .. } => {
+                        buf[written] = *byte;
+                        written += 1;
+                        self.remaining -= 1;
+                        break;
+                    }
+                    Node::Internal { left, right, .. } => {
+                        let bit = self.bit_reader.read_bit()?.ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "ran out of bits before reaching original_len",
+                            )
+                        })?;
+                        if bit {
+                            current = right;
+                        } else {
+                            current = left;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(written)
     }
 }
 
@@ -133,51 +198,44 @@ mod tests {
 
     #[test]
     fn packs_eight_bits_into_one_byte() {
-        let mut writer = BitWriter::new();
-        // Writing 1,0,1,1,0,0,1,0 left-to-right builds:
-        //   position: 7 6 5 4 3 2 1 0
-        //   bit:      1 0 1 1 0 0 1 0
-        // which as a byte is 0b10110010 = 178 decimal
-        writer.write_bit(true);
-        writer.write_bit(false);
-        writer.write_bit(true);
-        writer.write_bit(true);
-        writer.write_bit(false);
-        writer.write_bit(false);
-        writer.write_bit(true);
-        writer.write_bit(false);
+        let mut writer = BitWriter::new(Vec::new());
+        writer.write_bit(true).unwrap();
+        writer.write_bit(false).unwrap();
+        writer.write_bit(true).unwrap();
+        writer.write_bit(true).unwrap();
+        writer.write_bit(false).unwrap();
+        writer.write_bit(false).unwrap();
+        writer.write_bit(true).unwrap();
+        writer.write_bit(false).unwrap();
 
-        let bytes = writer.finish();
+        let bytes = writer.finish().unwrap();
         assert_eq!(bytes, vec![0b10110010]);
     }
 
     #[test]
     fn pads_incomplete_byte_with_zeros() {
-        let mut writer = BitWriter::new();
-        // Only 3 bits written: 1,1,1
-        // Positions 7,6,5 get set; positions 4,3,2,1,0 stay 0 (padding)
-        // Result: 0b11100000
-        writer.write_bit(true);
-        writer.write_bit(true);
-        writer.write_bit(true);
+        let mut writer = BitWriter::new(Vec::new());
+        writer.write_bit(true).unwrap();
+        writer.write_bit(true).unwrap();
+        writer.write_bit(true).unwrap();
 
-        let bytes = writer.finish();
+        let bytes = writer.finish().unwrap();
         assert_eq!(bytes, vec![0b11100000]);
     }
 
     #[test]
     fn reader_reverses_writer() {
-        let mut writer = BitWriter::new();
+        let mut writer = BitWriter::new(Vec::new());
         let bits = [
             true, false, true, true, false, false, true, false, true, true,
         ];
-        writer.write_bits(&bits);
-        let packed = writer.finish();
+        writer.write_bits(&bits).unwrap();
+        let packed = writer.finish().unwrap();
 
-        let mut reader = BitReader::new(&packed);
+        let mut reader = BitReader::new(packed.as_slice());
         let mut read_back: Vec<bool> = Vec::new();
         for _ in 0..bits.len() {
-            let bit = reader.read_bit().unwrap();
+            let bit = reader.read_bit().unwrap().unwrap();
             read_back.push(bit);
         }
 
