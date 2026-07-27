@@ -1,10 +1,10 @@
+use anyhow::{Result, bail};
 use std::collections::HashMap;
-
 const MAGIC: [u8; 6] = *b"BTREE1";
 
 /// Everything read back out of a header, needed to decompress.
 pub struct Header {
-    pub freqs: HashMap<u8, u32>,
+    pub freqs: HashMap<u8, u64>,
     pub original_len: u64,
     /// True if the compressed payload is a folder archive (built by
     /// archive.rs) rather than a single plain file's bytes.
@@ -14,7 +14,7 @@ pub struct Header {
 /// Build the header bytes: magic + archive flag + frequency table +
 /// original length. This does NOT include the compressed bitstream
 /// itself - that gets appended separately by compress.rs.
-pub fn write_header(freqs: &HashMap<u8, u32>, original_len: u64, is_archive: bool) -> Vec<u8> {
+pub fn write_header(freqs: &HashMap<u8, u64>, original_len: u64, is_archive: bool) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::new();
 
     // Magic number, so decompress can check "is this really our format?"
@@ -26,18 +26,18 @@ pub fn write_header(freqs: &HashMap<u8, u32>, original_len: u64, is_archive: boo
     // needs archive::extract_archive on the way out), 0 for a plain file.
     out.push(if is_archive { 1 } else { 0 });
 
-    // Number of distinct symbols, as 4 bytes (u32 little-endian).
-    let symbol_count = freqs.len() as u32;
-    let count_bytes = symbol_count.to_le_bytes(); // [u8; 4]
+    // Number of distinct symbols, as 8 bytes (u64 little-endian).
+    let symbol_count = freqs.len() as u64;
+    let count_bytes = symbol_count.to_le_bytes(); // [u8; 8]
     for byte in count_bytes {
         out.push(byte);
     }
 
-    // Each symbol: 1 byte for the value, 4 bytes for its frequency.
+    // Each symbol: 1 byte for the value, 8 bytes for its frequency.
     for (byte, freq) in freqs {
         out.push(*byte);
 
-        let freq_bytes = freq.to_le_bytes(); // [u8; 4]
+        let freq_bytes = freq.to_le_bytes(); // [u8; 8]
         for b in freq_bytes {
             out.push(b);
         }
@@ -55,37 +55,68 @@ pub fn write_header(freqs: &HashMap<u8, u32>, original_len: u64, is_archive: boo
 /// Read a header back out of the start of a compressed file's bytes.
 /// Returns the parsed Header, plus how many bytes the header took up
 /// (so the caller knows where the compressed bitstream starts).
-pub fn read_header(data: &[u8]) -> (Header, usize) {
+pub fn read_header(data: &[u8]) -> Result<(Header, usize)> {
     let mut pos: usize = 0;
 
     // Check the magic number matches what we expect.
-    let found_magic = &data[0..6];
-    assert_eq!(
-        found_magic, MAGIC,
-        "not a valid .bitree file (bad magic number)"
-    );
-    pos = pos + 6; //shift 6 pos since we checked Magic number
+    if data.len() < 6 {
+        bail!("data too short to contain a magic number");
+    }
+    let magic = &data[0..6];
+    if magic != MAGIC {
+        bail!("not a valid bitree archive (bad magic number)");
+    }
+    pos = pos + 6;
 
-    // Read the archive flag.
+    // Read the archive flag (1 byte).
+    if pos + 1 > data.len() {
+        bail!("truncated header: missing archive flag byte");
+    }
     let is_archive = data[pos] == 1;
     pos = pos + 1;
 
-    // Read the symbol count (4 bytes, little-endian u32).
-    let count_bytes = [data[pos], data[pos + 1], data[pos + 2], data[pos + 3]];
-    let symbol_count = u32::from_le_bytes(count_bytes);
-    pos = pos + 4; // shift 4 pos after reading the le count bytes
+    // Read the symbol count (8 bytes, little-endian u64).
+    if pos + 8 > data.len() {
+        bail!("truncated header: missing symbol count");
+    }
+    let count_bytes = [
+        data[pos],
+        data[pos + 1],
+        data[pos + 2],
+        data[pos + 3],
+        data[pos + 4],
+        data[pos + 5],
+        data[pos + 6],
+        data[pos + 7],
+    ];
+    let symbol_count = u64::from_le_bytes(count_bytes);
+    pos = pos + 8;
 
     // Read that many (byte, freq) pairs.
-    let mut freqs: HashMap<u8, u32> = HashMap::new();
+    let mut freqs: HashMap<u8, u64> = HashMap::new();
 
-    let mut i: u32 = 0;
+    let mut i: u64 = 0;
     while i < symbol_count {
+        // Each entry is 1 byte (symbol) + 8 bytes (freq) = 9 bytes.
+        if pos + 9 > data.len() {
+            bail!("truncated header: symbol table cut short");
+        }
+
         let byte_value = data[pos];
         pos = pos + 1;
 
-        let freq_bytes = [data[pos], data[pos + 1], data[pos + 2], data[pos + 3]];
-        let freq_value = u32::from_le_bytes(freq_bytes);
-        pos = pos + 4; // shift 4 pos every freq u32 we read
+        let freq_bytes = [
+            data[pos],
+            data[pos + 1],
+            data[pos + 2],
+            data[pos + 3],
+            data[pos + 4],
+            data[pos + 5],
+            data[pos + 6],
+            data[pos + 7],
+        ];
+        let freq_value = u64::from_le_bytes(freq_bytes);
+        pos = pos + 8;
 
         freqs.insert(byte_value, freq_value);
 
@@ -93,6 +124,9 @@ pub fn read_header(data: &[u8]) -> (Header, usize) {
     }
 
     // Read the original file length (8 bytes, little-endian u64).
+    if pos + 8 > data.len() {
+        bail!("truncated header: missing original length");
+    }
     let len_bytes = [
         data[pos],
         data[pos + 1],
@@ -104,7 +138,7 @@ pub fn read_header(data: &[u8]) -> (Header, usize) {
         data[pos + 7],
     ];
     let original_len = u64::from_le_bytes(len_bytes);
-    pos = pos + 8; // shift 8 pos after reading the u64 original len
+    pos = pos + 8;
 
     let header = Header {
         freqs: freqs,
@@ -112,7 +146,7 @@ pub fn read_header(data: &[u8]) -> (Header, usize) {
         is_archive: is_archive,
     };
 
-    (header, pos)
+    Ok((header, pos))
 }
 
 #[cfg(test)]
@@ -121,16 +155,13 @@ mod tests {
 
     #[test]
     fn round_trips_a_small_freq_table() {
-        let mut freqs: HashMap<u8, u32> = HashMap::new();
+        let mut freqs: HashMap<u8, u64> = HashMap::new();
         freqs.insert(b'a', 5);
         freqs.insert(b'b', 2);
         freqs.insert(b'c', 1);
-
         let original_len: u64 = 8;
-
         let header_bytes = write_header(&freqs, original_len, false);
-        let (parsed, header_size) = read_header(&header_bytes);
-
+        let (parsed, header_size) = read_header(&header_bytes).unwrap();
         assert_eq!(parsed.original_len, 8);
         assert_eq!(parsed.is_archive, false);
         assert_eq!(parsed.freqs.get(&b'a'), Some(&5));
@@ -141,12 +172,10 @@ mod tests {
 
     #[test]
     fn round_trips_the_archive_flag() {
-        let mut freqs: HashMap<u8, u32> = HashMap::new();
+        let mut freqs: HashMap<u8, u64> = HashMap::new();
         freqs.insert(b'x', 1);
-
         let header_bytes = write_header(&freqs, 1, true);
-        let (parsed, _) = read_header(&header_bytes);
-
+        let (parsed, _) = read_header(&header_bytes).unwrap();
         assert_eq!(parsed.is_archive, true);
     }
 }

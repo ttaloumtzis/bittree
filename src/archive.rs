@@ -121,6 +121,7 @@ pub fn build_archive(root: &Path) -> Result<Vec<u8>> {
 /// Unpack an archive byte stream (as produced by build_archive) back
 /// into real files and directories under `dest_root`.
 pub fn extract_archive(data: &[u8], dest_root: &Path) -> Result<()> {
+    let mut pos: usize = 0;
     // Even an "empty folder" archive still has magic + count (10 bytes),
     // so anything shorter than that can't be valid.
     if data.len() < 10 {
@@ -131,7 +132,7 @@ pub fn extract_archive(data: &[u8], dest_root: &Path) -> Result<()> {
     if magic != ARCHIVE_MAGIC {
         bail!("not a valid bitree archive (bad magic number)");
     }
-    let mut pos: usize = 6;
+    pos = pos + 6;
 
     let count_bytes = [data[pos], data[pos + 1], data[pos + 2], data[pos + 3]];
     let entry_count = u32::from_le_bytes(count_bytes);

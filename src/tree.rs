@@ -3,10 +3,10 @@ pub enum Node {
     // Definition of the Node data stucture in the binary tree
     Leaf {
         byte: u8,
-        freq: u32,
+        freq: u64,
     },
     Internal {
-        freq: u32,
+        freq: u64,
         left: Box<Node>,
         right: Box<Node>,
     },
@@ -14,7 +14,7 @@ pub enum Node {
 
 // Helper methods
 impl Node {
-    pub fn freq(&self) -> u32 {
+    pub fn freq(&self) -> u64 {
         match self {
             Node::Leaf { freq, .. } => *freq,
             Node::Internal { freq, .. } => *freq,
@@ -28,12 +28,12 @@ use std::collections::HashMap;
 
 /// Build a Huffman tree from a frequency table.
 /// Returns None if the input was empty (no bytes at all).
-pub fn build_tree(freqs: &HashMap<u8, u32>) -> Option<Node> {
+pub fn build_tree(freqs: &HashMap<u8, u64>) -> Option<Node> {
     // Collect into a Vec and sort by byte value. This gives a fixed,
     // reproducible order to build from every time - completely
     // independent of this particular HashMap's internal (randomized)
     // iteration order.
-    let mut entries: Vec<(u8, u32)> = Vec::new();
+    let mut entries: Vec<(u8, u64)> = Vec::new();
     for (byte, freq) in freqs {
         entries.push((*byte, *freq));
     }
@@ -104,7 +104,7 @@ mod tests {
 
     #[test]
     fn builds_tree_from_multiple_symbols() {
-        let mut freqs = HashMap::new();
+        let mut freqs: HashMap<u8, u64> = HashMap::new();
         freqs.insert(b'a', 5);
         freqs.insert(b'b', 2);
         freqs.insert(b'c', 1);
@@ -115,7 +115,7 @@ mod tests {
 
     #[test]
     fn builds_tree_from_single_symbol() {
-        let mut freqs = HashMap::new();
+        let mut freqs: HashMap<u8, u64> = HashMap::new();
         freqs.insert(b'x', 42);
 
         let tree = build_tree(&freqs).unwrap();

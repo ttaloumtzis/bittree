@@ -22,7 +22,7 @@ pub fn run(input: &Path, output: &Path) -> Result<()> {
     }
 
     // Step 1: parse the header out of the front of the file
-    let (parsed_header, header_size) = header::read_header(&file_bytes);
+    let (parsed_header, header_size) = header::read_header(&file_bytes)?;
     println!("original length was {} bytes", parsed_header.original_len);
     println!(
         "distinct byte values in header: {}",
