@@ -7,6 +7,7 @@ mod decompress;
 mod freq;
 mod header;
 mod heap;
+mod meta;
 mod tree;
 
 use anyhow::Result;

@@ -6,10 +6,14 @@ use crate::bitio::BitWriter;
 use crate::codes;
 use crate::freq;
 use crate::header;
+use crate::meta;
 use crate::tree;
 
 pub fn run(input: &Path, output: &Path) -> Result<()> {
     let is_archive = input.is_dir();
+
+    // Capture the input's own metadata before reading its bytes.
+    let input_meta = meta::read_meta(input)?;
 
     // If the input is a folder, pack it into a single in-memory byte
     // stream first (archive.rs). From this point on `data` is just a
@@ -39,7 +43,7 @@ pub fn run(input: &Path, output: &Path) -> Result<()> {
             // otherwise decompressing an empty archived folder would
             // silently produce a file instead of a folder.
             println!("input was empty, writing header-only output");
-            let header_bytes = header::write_header(&freqs, original_len, is_archive);
+            let header_bytes = header::write_header(&freqs, original_len, is_archive, &input_meta);
             std::fs::write(output, &header_bytes)?;
             return Ok(());
         }
@@ -59,7 +63,7 @@ pub fn run(input: &Path, output: &Path) -> Result<()> {
     let compressed_bits = writer.finish();
 
     // Build the header: magic + archive flag + frequency table + original length
-    let header_bytes = header::write_header(&freqs, original_len, is_archive);
+    let header_bytes = header::write_header(&freqs, original_len, is_archive, &input_meta);
 
     // Final file = header bytes, followed by the compressed bitstream
     let mut final_bytes: Vec<u8> = Vec::new();

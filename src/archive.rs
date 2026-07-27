@@ -2,10 +2,12 @@ use anyhow::{Context, Result, bail};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Separate magic number from the .bitree header magic, so a corrupted
-/// or mismatched file fails fast with a clear error instead of garbage
-/// output.
-const ARCHIVE_MAGIC: [u8; 6] = *b"BTAR01";
+use crate::meta;
+
+/// Bumped from BTAR01 -> BTAR02: entries now carry per-entry metadata
+/// (mtime + permissions), so an old archive must fail fast with a clear
+/// error instead of being misparsed against the new layout.
+const ARCHIVE_MAGIC: [u8; 6] = *b"BTAR02";
 
 const ENTRY_FILE: u8 = 0;
 const ENTRY_DIR: u8 = 1;
@@ -70,13 +72,14 @@ fn write_path(out: &mut Vec<u8>, path_bytes: &[u8]) {
 /// like the bytes of a regular file and run the existing pipeline
 /// (freq table -> tree -> codes -> bit packing) over it unchanged.
 ///
-/// Format:
-///   MAGIC (6 bytes: "BTAR01")
+/// Format (v2):
+///   MAGIC (6 bytes: "BTAR02")
 ///   entry_count (u32 LE)
 ///   for each entry:
 ///     kind (1 byte: 0 = file, 1 = dir)
 ///     path_len (u16 LE)
 ///     path bytes (UTF-8, '/' separated, relative to root)
+///     metadata (12 bytes: 8 mtime + 4 permissions)
 ///     [file only] content_len (u64 LE) + content bytes
 pub fn build_archive(root: &Path) -> Result<Vec<u8>> {
     let entries = collect_entries(root)?;
@@ -95,13 +98,17 @@ pub fn build_archive(root: &Path) -> Result<Vec<u8>> {
         let full_path = root.join(relative);
         let path_str = to_archive_path_string(relative);
         let path_bytes = path_str.as_bytes();
+        let file_meta = meta::read_meta(&full_path)
+            .with_context(|| format!("reading metadata for {:?}", full_path))?;
 
         if full_path.is_dir() {
             out.push(ENTRY_DIR);
             write_path(&mut out, path_bytes);
+            meta::write_meta_bytes(&mut out, &file_meta);
         } else {
             out.push(ENTRY_FILE);
             write_path(&mut out, path_bytes);
+            meta::write_meta_bytes(&mut out, &file_meta);
 
             let content =
                 fs::read(&full_path).with_context(|| format!("reading file {:?}", full_path))?;
@@ -118,8 +125,14 @@ pub fn build_archive(root: &Path) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Unpack an archive byte stream (as produced by build_archive) back
-/// into real files and directories under `dest_root`.
+/// Unpack an archive byte stream back into real files and directories
+/// under `dest_root`.
+///
+/// Directory metadata is applied in a SECOND pass, after every file has
+/// been written. Writing a file into a folder updates that folder's own
+/// mtime, so applying a directory's saved mtime immediately after
+/// creating it would just get overwritten by the files written into it
+/// afterward.
 pub fn extract_archive(data: &[u8], dest_root: &Path) -> Result<()> {
     let mut pos: usize = 0;
     // Even an "empty folder" archive still has magic + count (10 bytes),
@@ -141,6 +154,8 @@ pub fn extract_archive(data: &[u8], dest_root: &Path) -> Result<()> {
     fs::create_dir_all(dest_root)
         .with_context(|| format!("creating output directory {:?}", dest_root))?;
 
+    let mut pending_dir_meta: Vec<(PathBuf, meta::FileMeta)> = Vec::new();
+
     for _ in 0..entry_count {
         let kind = data[pos];
         pos += 1;
@@ -158,9 +173,13 @@ pub fn extract_archive(data: &[u8], dest_root: &Path) -> Result<()> {
         let relative: PathBuf = path_str.split('/').collect();
         let full_path = dest_root.join(&relative);
 
+        let file_meta = meta::read_meta_bytes(data, &mut pos)
+            .with_context(|| format!("reading metadata for {:?}", full_path))?;
+
         if kind == ENTRY_DIR {
             fs::create_dir_all(&full_path)
                 .with_context(|| format!("creating directory {:?}", full_path))?;
+            pending_dir_meta.push((full_path, file_meta));
         } else {
             let content_len_bytes = [
                 data[pos],
@@ -187,7 +206,19 @@ pub fn extract_archive(data: &[u8], dest_root: &Path) -> Result<()> {
 
             fs::write(&full_path, content)
                 .with_context(|| format!("writing file {:?}", full_path))?;
+
+            // Files are safe to apply immediately - nothing gets written
+            // into a file after it's written that would disturb its mtime.
+            meta::apply_meta(&full_path, &file_meta)
+                .with_context(|| format!("applying metadata to {:?}", full_path))?;
         }
+    }
+
+    // Second pass: now that every file is in place, set directory mtimes
+    // last so they aren't clobbered by the writes above.
+    for (dir_path, dir_meta) in &pending_dir_meta {
+        meta::apply_meta(dir_path, dir_meta)
+            .with_context(|| format!("applying metadata to {:?}", dir_path))?;
     }
 
     Ok(())
@@ -216,6 +247,39 @@ mod tests {
         assert_eq!(fs::read(dst.join("a.txt")).unwrap(), b"hello world");
         assert_eq!(fs::read(dst.join("sub/b.txt")).unwrap(), b"nested file");
         assert!(dst.join("empty_dir").is_dir());
+
+        fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn preserves_modification_time() {
+        let tmp = std::env::temp_dir().join(format!("bitree_meta_test_{}", std::process::id()));
+        let src = tmp.join("src");
+        let dst = tmp.join("dst");
+        let _ = fs::remove_dir_all(&tmp);
+
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("a.txt"), b"content").unwrap();
+
+        let original_meta = fs::metadata(src.join("a.txt")).unwrap();
+        let original_modified = original_meta.modified().unwrap();
+
+        let archive_bytes = build_archive(&src).unwrap();
+        extract_archive(&archive_bytes, &dst).unwrap();
+
+        let restored_meta = fs::metadata(dst.join("a.txt")).unwrap();
+        let restored_modified = restored_meta.modified().unwrap();
+
+        // Compare at second granularity, since that's all we store.
+        let original_secs = original_modified
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let restored_secs = restored_modified
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert_eq!(original_secs, restored_secs);
 
         fs::remove_dir_all(&tmp).unwrap();
     }

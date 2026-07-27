@@ -4,6 +4,7 @@ use std::path::Path;
 use crate::archive;
 use crate::bitio::BitReader;
 use crate::header;
+use crate::meta;
 use crate::tree;
 use crate::tree::Node;
 
@@ -87,6 +88,8 @@ pub fn run(input: &Path, output: &Path) -> Result<()> {
         println!("extracted folder archive to {:?}", output);
     } else {
         std::fs::write(output, &output_bytes)?;
+        // Restore the plain file's own metadata.
+        meta::apply_meta(output, &parsed_header.meta)?;
         println!("wrote decompressed output to {:?}", output);
     }
 
