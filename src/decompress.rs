@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
 use crate::archive;
@@ -22,12 +22,19 @@ pub fn run(input: &Path, output: &Path) -> Result<()> {
         return Ok(());
     }
 
-    let file = File::open(input)
-        .with_context(|| format!("opening {:?}", input))?;
+    let file = File::open(input).with_context(|| format!("opening {:?}", input))?;
     let mut buf_reader = BufReader::new(file);
 
-    let header = header::read_header_from_reader(&mut buf_reader)
-        .context("failed to read header")?;
+    let header =
+        header::read_header_from_reader(&mut buf_reader).context("failed to read header")?;
+
+    let pb = indicatif::ProgressBar::new(header.original_len);
+    pb.set_style(
+        indicatif::ProgressStyle::default_bar()
+            .template("[{elapsed_precise}] {bar:40.cyan/blue} {bytes}/{total_bytes} ({eta})")
+            .unwrap()
+            .progress_chars("##-"),
+    );
 
     println!("original length was {} bytes", header.original_len);
     println!("distinct byte values in header: {}", header.freqs.len());
@@ -47,26 +54,43 @@ pub fn run(input: &Path, output: &Path) -> Result<()> {
         return Ok(());
     }
 
-    let tree_root = tree::build_tree(&header.freqs)
-        .expect("header had frequencies but tree build failed");
+    let tree_root =
+        tree::build_tree(&header.freqs).expect("header had frequencies but tree build failed");
 
     let bit_reader = BitReader::new(buf_reader);
-    let mut huffman_reader = HuffmanByteReader::new(
-        &tree_root,
-        bit_reader,
-        header.original_len,
-    );
+    let mut huffman_reader = HuffmanByteReader::new(&tree_root, bit_reader, header.original_len);
 
     if header.is_archive {
+        let spinner = indicatif::ProgressBar::new_spinner();
+        spinner.enable_steady_tick(std::time::Duration::from_millis(100));
+        spinner.set_style(
+            indicatif::ProgressStyle::default_spinner()
+                .template("{spinner:.green} extracting...")
+                .unwrap(),
+        );
+
         archive::extract_archive_from_reader(&mut huffman_reader, output)?;
+
+        spinner.finish_with_message("extracted");
+
         println!("extracted folder archive to {:?}", output);
     } else {
-        let out_file = File::create(output)
-            .with_context(|| format!("creating output file {:?}", output))?;
+        let out_file =
+            File::create(output).with_context(|| format!("creating output file {:?}", output))?;
         let mut out_writer = BufWriter::new(out_file);
 
-        let bytes_written = std::io::copy(&mut huffman_reader, &mut out_writer)
-            .context("failed to decompress data")?;
+        let mut buf = [0u8; 64 * 1024];
+        let mut bytes_written = 0u64;
+        loop {
+            let n = huffman_reader.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            out_writer.write_all(&buf[..n])?;
+            bytes_written += n as u64;
+            pb.inc(n as u64);
+        }
+        pb.finish_and_clear();
 
         out_writer.flush()?;
 

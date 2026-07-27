@@ -45,6 +45,14 @@ pub fn run(input: &Path, output: &Path) -> Result<()> {
     for_each_input_chunk(input, is_archive, plan.as_deref(), count_chunk)?;
     println!("distinct byte values: {}", freqs.len());
 
+    let pb = indicatif::ProgressBar::new(original_len);
+    pb.set_style(
+        indicatif::ProgressStyle::default_bar()
+            .template("[{elapsed_precise}] {bar:40.cyan/blue} {bytes}/{total_bytes} ({eta})")
+            .unwrap()
+            .progress_chars("##-"),
+    );
+
     let tree_root = tree::build_tree(&freqs);
     let tree_root = match tree_root {
         Some(root) => root,
@@ -83,6 +91,7 @@ pub fn run(input: &Path, output: &Path) -> Result<()> {
 
             bit_writer.write_bits(code)?;
         }
+        pb.inc(chunk.len() as u64);
         Ok(())
     };
 
@@ -95,6 +104,8 @@ pub fn run(input: &Path, output: &Path) -> Result<()> {
     let mut out_writer = bit_writer.finish()?;
     out_writer.flush()?;
     drop(out_writer);
+
+    pb.finish_and_clear();
 
     let final_len = std::fs::metadata(output)?.len();
 
