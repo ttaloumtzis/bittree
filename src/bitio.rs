@@ -32,6 +32,15 @@ impl<W: Write> BitWriter<W> {
         Ok(())
     }
 
+    /// Write `nbits` LSB-first bits from `value`.
+    pub fn write_bits_value(&mut self, mut value: u32, nbits: u8) -> io::Result<()> {
+        for _ in 0..nbits {
+            self.write_bit((value & 1) != 0)?;
+            value >>= 1;
+        }
+        Ok(())
+    }
+
     /// Flush the final byte (zero-padded if partial).
     pub fn finish(mut self) -> io::Result<W> {
         if self.bits_filled > 0 {

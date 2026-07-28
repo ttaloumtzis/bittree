@@ -2,10 +2,14 @@ use std::io::{Read, Write};
 use anyhow::Result;
 
 pub mod huffman;
+pub mod lz77;
+pub mod deflate;
 
 #[derive(clap::ValueEnum, Clone, Debug)]
 pub enum Method {
     Huffman,
+    Lz77,
+    Deflate,
 }
 
 pub trait Codec {
@@ -24,12 +28,16 @@ pub trait Codec {
 pub fn create(method: Method) -> Box<dyn Codec> {
     match method {
         Method::Huffman => Box::new(huffman::HuffmanCodec::new()),
+        Method::Lz77 => Box::new(lz77::Lz77Codec::new()),
+        Method::Deflate => Box::new(deflate::DeflateCodec::new()),
     }
 }
 
 pub fn by_id(id: u8) -> Box<dyn Codec> {
     match id {
         0 => Box::new(huffman::HuffmanCodec::new()),
+        1 => Box::new(lz77::Lz77Codec::new()),
+        2 => Box::new(deflate::DeflateCodec::new()),
         _ => panic!("unknown codec id: {id}"),
     }
 }

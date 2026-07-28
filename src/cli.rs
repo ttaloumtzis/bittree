@@ -12,6 +12,7 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
+    #[command(alias = "c")]
     Compress {
         input: PathBuf,
 
@@ -22,6 +23,7 @@ pub enum Command {
         method: codec::Method,
     },
 
+    #[command(alias = "d")]
     Decompress {
         input: PathBuf,
 

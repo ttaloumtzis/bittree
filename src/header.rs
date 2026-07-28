@@ -1,24 +1,37 @@
 use anyhow::{Context, Result, bail};
 use std::io::Read;
 
+use crate::codec::{self, Codec};
 use crate::meta::{FileMeta, read_meta_from_reader, write_meta_bytes};
 
-const MAGIC: [u8; 4] = *b"BITR";
+const MAGIC: [u8; 5] = *b"BTRE1";
 
-pub struct CommonHeader {
+pub struct FileHeader {
     pub method_id: u8,
     pub is_archive: bool,
     pub meta: FileMeta,
     pub original_len: u64,
 }
 
-impl CommonHeader {
+impl FileHeader {
     pub fn new(method_id: u8, original_len: u64, is_archive: bool, meta: FileMeta) -> Self {
-        CommonHeader { method_id, is_archive, meta, original_len }
+        FileHeader { method_id, is_archive, meta, original_len }
+    }
+
+    pub fn write_full<W: std::io::Write>(&self, output: &mut W, codec: &dyn Codec) -> Result<()> {
+        self.write(output)?;
+        codec.write_header(output)
+    }
+
+    pub fn read_full<R: Read>(input: &mut R) -> Result<(Self, Box<dyn Codec>)> {
+        let header = Self::read(input)?;
+        let mut codec = codec::by_id(header.method_id);
+        codec.read_header(input)?;
+        Ok((header, codec))
     }
 
     pub fn write<W: std::io::Write>(&self, output: &mut W) -> Result<()> {
-        let mut buf = Vec::with_capacity(4 + 1 + 1 + 12 + 8);
+        let mut buf = Vec::with_capacity(5 + 1 + 1 + 12 + 8);
         buf.extend_from_slice(&MAGIC);
         buf.push(self.method_id);
         buf.push(self.is_archive as u8);
@@ -29,7 +42,7 @@ impl CommonHeader {
     }
 
     pub fn read<R: Read>(input: &mut R) -> Result<Self> {
-        let mut magic = [0u8; 4];
+        let mut magic = [0u8; 5];
         input.read_exact(&mut magic).context("data too short for magic")?;
         if magic != MAGIC {
             bail!("not a valid bitree file");
@@ -46,7 +59,7 @@ impl CommonHeader {
         let mut len_bytes = [0u8; 8];
         input.read_exact(&mut len_bytes).context("truncated header: missing original length")?;
 
-        Ok(CommonHeader {
+        Ok(FileHeader {
             method_id: method_id[0],
             is_archive: flag[0] == 1,
             meta,
@@ -67,11 +80,11 @@ mod tests {
     #[test]
     fn round_trips_a_small_header() {
         let meta = dummy_meta();
-        let h = CommonHeader::new(0, 8, false, meta);
+        let h = FileHeader::new(0, 8, false, meta);
         let mut bytes = Vec::new();
         h.write(&mut bytes).unwrap();
 
-        let parsed = CommonHeader::read(&mut std::io::Cursor::new(&bytes)).unwrap();
+        let parsed = FileHeader::read(&mut std::io::Cursor::new(&bytes)).unwrap();
         assert_eq!(parsed.original_len, 8);
         assert_eq!(parsed.method_id, 0);
         assert!(!parsed.is_archive);
@@ -81,16 +94,16 @@ mod tests {
     #[test]
     fn round_trips_the_archive_flag() {
         let meta = dummy_meta();
-        let h = CommonHeader::new(0, 1, true, meta);
+        let h = FileHeader::new(0, 1, true, meta);
         let mut bytes = Vec::new();
         h.write(&mut bytes).unwrap();
-        let parsed = CommonHeader::read(&mut std::io::Cursor::new(&bytes)).unwrap();
+        let parsed = FileHeader::read(&mut std::io::Cursor::new(&bytes)).unwrap();
         assert!(parsed.is_archive);
     }
 
     #[test]
     fn rejects_truncated_data() {
         let short = vec![1, 2, 3];
-        assert!(CommonHeader::read(&mut std::io::Cursor::new(&short)).is_err());
+        assert!(FileHeader::read(&mut std::io::Cursor::new(&short)).is_err());
     }
 }

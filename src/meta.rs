@@ -8,6 +8,28 @@ pub struct FileMeta {
     pub permissions: u32,
 }
 
+pub fn from_metadata(md: &std::fs::Metadata) -> FileMeta {
+    let modified_secs = md
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    #[cfg(unix)]
+    let permissions = {
+        use std::os::unix::fs::PermissionsExt;
+        md.permissions().mode()
+    };
+    #[cfg(not(unix))]
+    let permissions: u32 = 0;
+
+    FileMeta {
+        modified_secs,
+        permissions,
+    }
+}
+
 pub fn read_meta(path: &Path) -> Result<FileMeta> {
     let metadata = std::fs::metadata(path)?;
 

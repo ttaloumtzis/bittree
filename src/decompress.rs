@@ -3,8 +3,7 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
 use crate::archive;
-use crate::codec;
-use crate::header::CommonHeader;
+use crate::header::FileHeader;
 use crate::meta;
 
 struct ProgressReader<'a, R: Read> {
@@ -34,7 +33,8 @@ pub fn run(input: &Path, output: &Path) -> Result<()> {
     let file = std::fs::File::open(input).with_context(|| format!("opening {:?}", input))?;
     let mut buf_reader = BufReader::new(file);
 
-    let common = CommonHeader::read(&mut buf_reader).context("failed to read header")?;
+    let (common, codec) = FileHeader::read_full(&mut buf_reader)
+        .context("failed to read header")?;
 
     let pb = indicatif::ProgressBar::new(common.original_len);
     pb.set_style(
@@ -59,9 +59,6 @@ pub fn run(input: &Path, output: &Path) -> Result<()> {
         }
         return Ok(());
     }
-
-    let mut codec = codec::by_id(common.method_id);
-    codec.read_header(&mut buf_reader).context("failed to read codec header")?;
 
     let decoder = codec.decoder(Box::new(buf_reader), common.original_len);
     let mut progress = ProgressReader { inner: decoder, pb: &pb };

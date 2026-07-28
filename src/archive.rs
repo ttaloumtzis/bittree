@@ -11,68 +11,78 @@ const ARCHIVE_MAGIC: [u8; 6] = *b"BTAR02";
 const ENTRY_FILE: u8 = 0;
 const ENTRY_DIR: u8 = 1;
 
-pub struct PlannedEntry {
-    pub relative: PathBuf,
-    pub full_path: PathBuf,
-    pub kind: u8, // ENTRY_FILE or ENTRY_DIR
-    pub meta: meta::FileMeta,
+/// State-machine directory walker.
+///
+/// Pre-order DFS (directories before their children).
+/// Uses `entry.file_type()` to avoid following symlinks — dir symlinks
+/// are skipped (prevents infinite cycles), file symlinks are preserved.
+struct DirWalker {
+    root: PathBuf,
+    stack: Vec<fs::ReadDir>,
+    entries: Vec<PathBuf>,
 }
 
-/// Collect paths + metadata (no file content).
-pub fn plan_archive(root: &Path) -> Result<Vec<PlannedEntry>> {
-    let entries = collect_entries(root)?;
-
-    let mut planned = Vec::with_capacity(entries.len());
-    for relative in entries {
-        let full_path = root.join(&relative);
-        let kind = if full_path.is_dir() {
-            ENTRY_DIR
-        } else {
-            ENTRY_FILE
-        };
-        let meta = meta::read_meta(&full_path)
-            .with_context(|| format!("reading metadata for {:?}", full_path))?;
-
-        planned.push(PlannedEntry {
-            relative,
-            full_path,
-            kind,
-            meta,
-        });
+impl DirWalker {
+    fn new(root: &Path) -> Self {
+        DirWalker { root: root.to_path_buf(), stack: Vec::new(), entries: Vec::new() }
     }
 
-    Ok(planned)
-}
+    fn walk(&mut self) -> Result<Vec<PathBuf>> {
+        self.stack.push(
+            fs::read_dir(&self.root)
+                .with_context(|| format!("reading directory {:?}", self.root))?,
+        );
 
-/// Recursive dir walk, sorted for reproducibility.
-fn collect_entries(root: &Path) -> Result<Vec<PathBuf>> {
-    let mut entries = Vec::new();
-    collect_entries_inner(root, root, &mut entries)?;
-    entries.sort();
-    Ok(entries)
-}
-
-fn collect_entries_inner(root: &Path, current: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
-    let read_dir =
-        fs::read_dir(current).with_context(|| format!("reading directory {:?}", current))?;
-
-    for entry in read_dir {
-        let entry = entry?;
-        let path = entry.path();
-        let relative = path
-            .strip_prefix(root)
-            .with_context(|| format!("stripping prefix from {:?}", path))?
-            .to_path_buf();
-
-        if path.is_dir() {
-            out.push(relative.clone());
-            collect_entries_inner(root, &path, out)?;
-        } else {
-            out.push(relative);
+        loop {
+            if self.stack.is_empty() {
+                break;
+            }
+            let top_idx = self.stack.len() - 1;
+            match self.stack[top_idx].next() {
+                Some(Ok(entry)) => {
+                    let ft = match entry.file_type() {
+                        Ok(ft) => ft,
+                        Err(e) => return Err(e.into()),
+                    };
+                    let relative = match entry.path().strip_prefix(&self.root) {
+                        Ok(r) => r.to_path_buf(),
+                        Err(_) => continue,
+                    };
+                    if ft.is_dir() {
+                        self.entries.push(relative);
+                        self.stack.push(
+                            fs::read_dir(entry.path())
+                                .with_context(|| format!("reading directory {:?}", entry.path()))?,
+                        );
+                    } else if ft.is_file() {
+                        self.entries.push(relative);
+                    } else if ft.is_symlink() {
+                        match fs::metadata(entry.path()) {
+                            Ok(md) if md.is_file() => self.entries.push(relative),
+                            _ => {},
+                        }
+                    }
+                }
+                Some(Err(e)) => return Err(e.into()),
+                None => {
+                    self.stack.pop();
+                }
+            }
         }
-    }
 
-    Ok(())
+        self.entries.sort();
+        Ok(std::mem::take(&mut self.entries))
+    }
+}
+
+/// Collect sorted relative paths (no metadata, no content).
+fn collect_entries(root: &Path) -> Result<Vec<PathBuf>> {
+    DirWalker::new(root).walk()
+}
+
+/// Collect sorted relative paths (same as `collect_entries`).
+pub fn plan_archive(root: &Path) -> Result<Vec<PathBuf>> {
+    collect_entries(root)
 }
 
 /// Normalize path to '/' separators for portability.
@@ -90,32 +100,39 @@ fn write_path(out: &mut Vec<u8>, path_bytes: &[u8]) {
 
 /// Stream archive bytes to `sink` in chunks (no full buffering).
 pub fn stream_archive(
-    plan: &[PlannedEntry],
+    root: &Path,
+    entries: &[PathBuf],
     mut sink: impl FnMut(&[u8]) -> Result<()>,
 ) -> Result<()> {
     sink(&ARCHIVE_MAGIC)?;
 
-    let entry_count = plan.len() as u32;
+    let entry_count = entries.len() as u32;
     sink(&entry_count.to_le_bytes())?;
 
-    for entry in plan {
-        let path_str = to_archive_path_string(&entry.relative);
+    for relative in entries {
+        let full_path = root.join(relative);
+        let path_str = to_archive_path_string(relative);
         let path_bytes = path_str.as_bytes();
 
-        sink(&[entry.kind])?;
+        let md = fs::metadata(&full_path)
+            .with_context(|| format!("reading metadata for {:?}", full_path))?;
+        let kind = if md.is_dir() { ENTRY_DIR } else { ENTRY_FILE };
+        let file_meta = meta::from_metadata(&md);
+
+        sink(&[kind])?;
         sink(&(path_bytes.len() as u16).to_le_bytes())?;
         sink(path_bytes)?;
 
         let mut meta_bytes = Vec::new();
-        meta::write_meta_bytes(&mut meta_bytes, &entry.meta);
+        meta::write_meta_bytes(&mut meta_bytes, &file_meta);
         sink(&meta_bytes)?;
 
-        if entry.kind == ENTRY_FILE {
-            let content_len = fs::metadata(&entry.full_path)?.len();
+        if kind == ENTRY_FILE {
+            let content_len = md.len();
             sink(&content_len.to_le_bytes())?;
 
-            let file = fs::File::open(&entry.full_path)
-                .with_context(|| format!("opening file {:?}", entry.full_path))?;
+            let file = fs::File::open(&full_path)
+                .with_context(|| format!("opening file {:?}", full_path))?;
             let mut reader = std::io::BufReader::new(file);
             let mut buf = [0u8; 64 * 1024];
             loop {
@@ -282,6 +299,35 @@ mod tests {
         fs::create_dir_all(src.join("empty_dir")).unwrap();
 
         let archive_bytes = build_archive(&src).unwrap();
+        extract_archive(&archive_bytes, &dst).unwrap();
+
+        assert_eq!(fs::read(dst.join("a.txt")).unwrap(), b"hello world");
+        assert_eq!(fs::read(dst.join("sub/b.txt")).unwrap(), b"nested file");
+        assert!(dst.join("empty_dir").is_dir());
+
+        fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn stream_archive_round_trips_a_folder_tree() {
+        let tmp = std::env::temp_dir().join(format!("bitree_stream_test_{}", std::process::id()));
+        let src = tmp.join("src");
+        let dst = tmp.join("dst");
+        let _ = fs::remove_dir_all(&tmp);
+
+        fs::create_dir_all(src.join("sub")).unwrap();
+        fs::write(src.join("a.txt"), b"hello world").unwrap();
+        fs::write(src.join("sub/b.txt"), b"nested file").unwrap();
+        fs::create_dir_all(src.join("empty_dir")).unwrap();
+
+        let plan = plan_archive(&src).unwrap();
+        let mut archive_bytes = Vec::new();
+        stream_archive(&src, &plan, |chunk| {
+            archive_bytes.extend_from_slice(chunk);
+            Ok(())
+        })
+        .unwrap();
+
         extract_archive(&archive_bytes, &dst).unwrap();
 
         assert_eq!(fs::read(dst.join("a.txt")).unwrap(), b"hello world");

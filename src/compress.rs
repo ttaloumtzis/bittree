@@ -1,10 +1,10 @@
 use anyhow::Result;
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::archive;
 use crate::codec;
-use crate::header::CommonHeader;
+use crate::header::FileHeader;
 use crate::meta;
 
 pub fn run(input: &Path, output: &Path, method: codec::Method) -> Result<()> {
@@ -24,11 +24,10 @@ pub fn run(input: &Path, output: &Path, method: codec::Method) -> Result<()> {
     codec.finalize_feed()?;
     codec.report();
 
-    let common = CommonHeader::new(codec.method_id(), original_len, is_archive, input_meta);
+    let header = FileHeader::new(codec.method_id(), original_len, is_archive, input_meta);
     let out_file = std::fs::File::create(output)?;
     let mut out_writer = std::io::BufWriter::new(out_file);
-    common.write(&mut out_writer)?;
-    codec.write_header(&mut out_writer)?;
+    header.write_full(&mut out_writer, &*codec)?;
 
     if original_len == 0 {
         println!("input was empty, writing header-only output");
@@ -66,12 +65,12 @@ pub fn run(input: &Path, output: &Path, method: codec::Method) -> Result<()> {
 fn for_each_input_chunk(
     input: &Path,
     is_archive: bool,
-    plan: Option<&[archive::PlannedEntry]>,
+    plan: Option<&[PathBuf]>,
     mut f: impl FnMut(&[u8]) -> Result<()>,
 ) -> Result<()> {
     if is_archive {
         let plan = plan.expect("archive plan required when is_archive is true");
-        archive::stream_archive(plan, |chunk| f(chunk))?;
+        archive::stream_archive(input, plan, |chunk| f(chunk))?;
     } else {
         let file = std::fs::File::open(input)?;
         let mut reader = std::io::BufReader::new(file);
